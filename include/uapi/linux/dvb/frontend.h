@@ -540,7 +540,6 @@ struct dtv_property {
 			__u32 reserved1[3];
 			void *reserved2;
 		} buffer;
-		__u32 reserved[14];
 	} u;
 	int result;
 } __attribute__ ((packed));
@@ -550,10 +549,7 @@ struct dtv_property {
 
 struct dtv_properties {
 	__u32 num;
-	union {
-		struct dtv_property *props;
-		__u64 reserved;
-	};
+	struct dtv_property *props;
 };
 
 #define FE_SET_PROPERTY		   _IOW('o', 82, struct dtv_properties)
