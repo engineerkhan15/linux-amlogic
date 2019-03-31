@@ -108,6 +108,7 @@ static u32 osd_vpp_misc_mask;
 static bool update_osd_vpp_misc;
 
 #ifdef CONFIG_GE2D_KEEP_FRAME
+#include <linux/amlogic/ge2d/ge2d.h>
 /* #if MESON_CPU_TYPE >= MESON_CPU_TYPE_MESON6 */
 /* #include <mach/mod_gate.h> */
 /* #endif */
@@ -133,6 +134,17 @@ bool platform_type = 1;
 
 /* for bit depth setting. */
 int bit_depth_flag = 8;
+
+struct amvideo_private {
+	struct vframe_s * ext_get_current;
+};
+
+struct amvideo_grabber_data {
+	int canvas_index;
+	u32 canvas0Addr;
+	u32 ge2dformat;
+	u64 size;
+};
 
 bool omx_secret_mode = false;
 EXPORT_SYMBOL(omx_secret_mode);
@@ -203,6 +215,15 @@ static int video2_onoff_state = VIDEO_ENABLE_STATE_IDLE;
 #define BRIDGE_IRQ_SET() WRITE_CBUS_REG(ISA_TIMERC, 1)
 #endif
 
+#ifdef CONFIG_AM_VIDEOCAPTURE
+enum video_capture_state {
+	CAPTURE_STATE_OFF = 0,
+	CAPTURE_STATE_ON = 1,
+	CAPTURE_STATE_CAPTURE = 2,
+};
+
+atomic_t capture_use_cnt = ATOMIC_INIT(CAPTURE_STATE_OFF);
+#endif
 
 
 #if 1	/* MESON_CPU_TYPE >= MESON_CPU_TYPE_MESON8 */
@@ -289,6 +310,14 @@ static int video2_onoff_state = VIDEO_ENABLE_STATE_IDLE;
 		spin_lock_irqsave(&video_onoff_lock, flags); \
 		video_onoff_state = VIDEO_ENABLE_STATE_OFF_REQ; \
 		video_enabled = 0;\
+		atomic_set(&capture_use_cnt, CAPTURE_STATE_OFF); \
+		if (capture_frame_req && capture_frame_req->data) { \
+			struct amvideocap_req_data *reqdata = \
+				(struct amvideocap_req_data *)capture_frame_req->data; \
+			if (reqdata && reqdata->privdata) \
+				reqdata->privdata->state = 0xffff; \
+		} \
+		capture_frame_req = NULL; \
 		spin_unlock_irqrestore(&video_onoff_lock, flags); \
 	} while (0)
 
@@ -531,7 +560,7 @@ static u32 video_scaler_mode;
 static int content_top = 0, content_left = 0, content_w = 0, content_h;
 static int scaler_pos_changed;
 #endif
-static struct amvideocap_req *capture_frame_req;
+static struct amvideocap_req *capture_frame_req = NULL;
 static struct video_prot_s video_prot;
 static u32 video_angle;
 u32 get_video_angle(void)
@@ -859,7 +888,6 @@ void safe_disble_videolayer(void)
 #endif
 }
 
-
 /*********************************************************/
 static inline struct vframe_s *video_vf_peek(void)
 {
@@ -873,8 +901,6 @@ static inline struct vframe_s *video_vf_get(void)
 
 	if (vf) {
 		video_notify_flag |= VIDEO_NOTIFY_PROVIDER_GET;
-		atomic_set(&vf->use_cnt, 1);
-		/*always to 1,for first get from vfm provider */
 		if ((vf->type & VIDTYPE_MVC) && (framepacking_support)
 		&&(framepacking_width) && (framepacking_height)) {
 			vf->width = framepacking_width;
@@ -944,8 +970,7 @@ static int vf_get_states(struct vframe_states *states)
 
 static inline void video_vf_put(struct vframe_s *vf)
 {
-	struct vframe_provider_s *vfp = vf_get_provider(RECEIVER_NAME);
-	if (vfp && vf && atomic_dec_and_test(&vf->use_cnt)) {
+	if (vf) {
 		vf_put(vf, RECEIVER_NAME);
 		if (is_dolby_vision_enable())
 			dolby_vision_vf_put(vf);
@@ -953,22 +978,18 @@ static inline void video_vf_put(struct vframe_s *vf)
 	}
 }
 
+#ifdef CONFIG_AM_VIDEOCAPTURE
 int ext_get_cur_video_frame(struct vframe_s **vf, int *canvas_index)
 {
 	if (cur_dispbuf == NULL)
 		return -1;
-	atomic_inc(&cur_dispbuf->use_cnt);
 	*canvas_index = READ_VCBUS_REG(VD1_IF0_CANVAS0 + cur_dev->viu_off);
 	*vf = cur_dispbuf;
 	return 0;
 }
-#ifdef CONFIG_AM_VIDEOCAPTURE
 
 int ext_put_video_frame(struct vframe_s *vf)
 {
-	if (vf == &vf_local)
-		return 0;
-	video_vf_put(vf);
 	return 0;
 }
 int is_need_framepacking_output(void)
@@ -981,33 +1002,53 @@ int is_need_framepacking_output(void)
 	return ret;
 }
 
-
 int ext_register_end_frame_callback(struct amvideocap_req *req)
 {
-	mutex_lock(&video_module_mutex);
-	capture_frame_req = req;
-	mutex_unlock(&video_module_mutex);
-	return 0;
+	int ret = -EAGAIN;
+
+	if (!req) {
+		atomic_set(&capture_use_cnt, CAPTURE_STATE_ON);
+		ret = 0;
+	}
+	else if (atomic_read(&capture_use_cnt) == CAPTURE_STATE_ON && req)
+	{
+		capture_frame_req = req;
+		atomic_set(&capture_use_cnt, CAPTURE_STATE_CAPTURE);
+		ret = 0;
+	}
+	else if ( atomic_read(&capture_use_cnt) == CAPTURE_STATE_OFF)
+		ret = -ENODATA;
+
+	return ret;
 }
-int ext_frame_capture_poll(int endflags)
+
+int ext_frame_capture_poll(struct vframe_s *vf)
 {
-	mutex_lock(&video_module_mutex);
-	if (capture_frame_req && capture_frame_req->callback) {
-		struct vframe_s *vf;
-		int index;
-		int ret;
-		struct amvideocap_req *req = capture_frame_req;
-		ret = ext_get_cur_video_frame(&vf, &index);
-		if (!ret) {
-			req->callback(req->data, vf, index);
+	int ret = -EAGAIN;
+	static int capture_frame_toggle = 0;
+
+	if (capture_frame_toggle == 0 && vf) {
+		if (vf->duration > 0 && (96000 / vf->duration) > 30)
+			capture_frame_toggle = 1;
+
+		if (atomic_read(&capture_use_cnt) == CAPTURE_STATE_CAPTURE && capture_frame_req && capture_frame_req->callback) {
+			struct amvideocap_req_data *reqdata =
+				(struct amvideocap_req_data *)capture_frame_req->data;
+			int index = READ_VCBUS_REG(VD1_IF0_CANVAS0 + cur_dev->viu_off);
+
+			if (reqdata && reqdata->privdata)
+				ret = capture_frame_req->callback(reqdata->privdata, vf, index);
+
 			capture_frame_req = NULL;
+			atomic_set(&capture_use_cnt, CAPTURE_STATE_ON);
 		}
 	}
-	mutex_unlock(&video_module_mutex);
-	return 0;
+	else
+		capture_frame_toggle = 0;
+
+	return ret;
 }
 #endif
-
 
 static void vpp_settings_h(struct vpp_frame_par_s *framePtr)
 {
@@ -2465,6 +2506,9 @@ static void vsync_toggle_frame(struct vframe_s *vf)
 		}
 	}
 	cur_dispbuf = vf;
+#ifdef CONFIG_AM_VIDEOCAPTURE
+	ext_frame_capture_poll(cur_dispbuf);
+#endif
 	if (first_picture) {
 		frame_par_ready_to_set = 1;
 
@@ -5323,7 +5367,6 @@ alternative mode,passing two buffer in one frame */
 			VFRAME_EVENT_PROVIDER_SET_3D_VFRAME_INTERLEAVE,
 				(void *)1);
 		}
-
 		video_vf_light_unreg_provider();
 	} else if (type == VFRAME_EVENT_PROVIDER_FORCE_BLACKOUT) {
 		force_blackout = 1;
@@ -5520,6 +5563,14 @@ static void _set_video_window(int *p)
  *********************************************************/
 static int amvideo_open(struct inode *inode, struct file *file)
 {
+	struct amvideo_private* priv =
+		kzalloc(sizeof(struct amvideo_private), GFP_KERNEL);
+
+	if (!priv)
+		return -ENOMEM;
+
+	file->private_data = priv;
+
 	return 0;
 }
 
@@ -5530,6 +5581,14 @@ static int amvideo_poll_open(struct inode *inode, struct file *file)
 
 static int amvideo_release(struct inode *inode, struct file *file)
 {
+	struct amvideo_private* priv = file->private_data;
+	if (priv->ext_get_current) {
+		ext_put_video_frame(priv->ext_get_current);
+	}
+
+	kfree(priv);
+	file->private_data = NULL;
+
 	if (blackout | force_blackout) {
 		/*	DisableVideoLayer();
 		don't need it ,it have problem on  pure music playing */
@@ -5550,6 +5609,7 @@ static long amvideo_ioctl(struct file *file, unsigned int cmd, ulong arg)
 {
 	long ret = 0;
 	void __user *argp = (void __user *)arg;
+	struct amvideo_private* priv = file->private_data;
 
 	switch (cmd) {
 	case AMSTREAM_IOC_SET_OMX_VPTS:{
@@ -5849,6 +5909,131 @@ static long amvideo_ioctl(struct file *file, unsigned int cmd, ulong arg)
 		vsync_slow_factor = arg;
 		break;
 
+	/****************************************************************
+	Video frame ioctl
+	*****************************************************************/
+	case AMVIDEO_EXT_GET_CURRENT_VIDEOFRAME:
+		{
+			struct vframe_s *vf;
+			int canvas_index;
+
+			ret = -EEXIST;
+
+			if (!priv->ext_get_current) {
+				ret = ext_get_cur_video_frame(&vf, &canvas_index);
+				if (!ret) {
+					priv->ext_get_current = vf;
+					put_user(canvas_index, (int __user *)argp);
+				}
+				else
+					ret = -EAGAIN;
+			}
+		}
+		break;
+
+	case AMVIDEO_EXT_PUT_CURRENT_VIDEOFRAME:
+		{
+			if (priv->ext_get_current) {
+				ext_put_video_frame(priv->ext_get_current);
+				priv->ext_get_current = NULL;
+				ret = 0;
+			}
+			else {
+				ret = -EEXIST;
+			}
+		}
+		break;
+
+	case AMVIDEO_EXT_CURRENT_VIDEOFRAME_GET_GE2D_FORMAT:
+		{
+			u32 format = 0;
+
+			ret = -ENOENT;
+
+			if (priv->ext_get_current) {
+				if ((priv->ext_get_current->type & VIDTYPE_VIU_422) == VIDTYPE_VIU_422) {
+					format = GE2D_FORMAT_S16_YUV422;
+				}
+				else if ((priv->ext_get_current->type & VIDTYPE_VIU_444) == VIDTYPE_VIU_444) {
+					format = GE2D_FORMAT_S24_YUV444;
+				}
+				else if ((priv->ext_get_current->type & VIDTYPE_VIU_NV21) == VIDTYPE_VIU_NV21) {
+					format = GE2D_FORMAT_M24_NV21;
+				}
+				put_user(format, (u32 __user *)argp);
+				ret = 0;
+			}
+		}
+		break;
+
+	case AMVIDEO_EXT_CURRENT_VIDEOFRAME_GET_SIZE:
+		{
+			u64 size;
+
+			ret = -ENOENT;
+
+			if (priv->ext_get_current) {
+				size = ((u64)priv->ext_get_current->width << 32) |
+					   priv->ext_get_current->height;
+				put_user(size, (u64 __user *)argp);
+				ret = 0;
+			}
+		}
+		break;
+
+	case AMVIDEO_EXT_CURRENT_VIDEOFRAME_GET_CANVAS0ADDR:
+		{
+			u32 canvas0Addr;
+
+			ret = -ENOENT;
+
+			if (priv->ext_get_current) {
+				canvas0Addr = priv->ext_get_current->canvas0Addr;
+				put_user(canvas0Addr, (u32 __user *)argp);
+				ret = 0;
+			}
+		}
+		break;
+
+	case AMVIDEO_EXT_CURRENT_VIDEOFRAME_GET_DATA:
+		{
+			struct vframe_s *vf;
+
+			ret = -EFAULT;
+
+			if (!priv->ext_get_current) {
+				int canvas_index;
+				ret = ext_get_cur_video_frame(&vf, &canvas_index);
+
+				if (!ret) {
+					struct amvideo_grabber_data grabber_data;
+
+					priv->ext_get_current = vf;
+
+					grabber_data.canvas_index = canvas_index;
+					grabber_data.canvas0Addr = priv->ext_get_current->canvas0Addr;
+
+					if ((priv->ext_get_current->type & VIDTYPE_VIU_422) == VIDTYPE_VIU_422) {
+						grabber_data.ge2dformat = GE2D_FORMAT_S16_YUV422;
+					}
+					else if ((priv->ext_get_current->type & VIDTYPE_VIU_444) == VIDTYPE_VIU_444) {
+						grabber_data.ge2dformat = GE2D_FORMAT_S24_YUV444;
+					}
+					else if ((priv->ext_get_current->type & VIDTYPE_VIU_NV21) == VIDTYPE_VIU_NV21) {
+						grabber_data.ge2dformat = GE2D_FORMAT_M24_NV21;
+					}
+
+					grabber_data.size = ((u64)priv->ext_get_current->width << 32) |
+						   priv->ext_get_current->height;
+
+					copy_to_user(argp, &grabber_data, sizeof(struct amvideo_grabber_data));
+				}
+				else
+					ret = -EAGAIN;
+			}
+		}
+		break;
+
 	default:
 		return -EINVAL;
 	}
@@ -5885,6 +6070,11 @@ static long amvideo_compat_ioctl(struct file *file, unsigned int cmd, ulong arg)
 	case AMSTREAM_IOC_GET_3D_TYPE:
 	case AMSTREAM_IOC_GET_SOURCE_VIDEO_3D_TYPE:
 	case AMSTREAM_IOC_GET_VSYNC_SLOW_FACTOR:
+	case AMVIDEO_EXT_GET_CURRENT_VIDEOFRAME:
+	case AMVIDEO_EXT_CURRENT_VIDEOFRAME_GET_GE2D_FORMAT:
+	case AMVIDEO_EXT_CURRENT_VIDEOFRAME_GET_SIZE:
+	case AMVIDEO_EXT_CURRENT_VIDEOFRAME_GET_CANVAS0ADDR:
+	case AMVIDEO_EXT_CURRENT_VIDEOFRAME_GET_DATA:
 		arg = (unsigned long) compat_ptr(arg);
 	case AMSTREAM_IOC_TRICKMODE:
 	case AMSTREAM_IOC_VPAUSE:
@@ -5904,6 +6094,7 @@ static long amvideo_compat_ioctl(struct file *file, unsigned int cmd, ulong arg)
 	case AMSTREAM_IOC_SET_3D_TYPE:
 	case AMSTREAM_IOC_SET_VSYNC_UPINT:
 	case AMSTREAM_IOC_SET_VSYNC_SLOW_FACTOR:
+	case AMVIDEO_EXT_PUT_CURRENT_VIDEOFRAME:
 		return amvideo_ioctl(file, cmd, arg);
 	default:
 		return -EINVAL;
