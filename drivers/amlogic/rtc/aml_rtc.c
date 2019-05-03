@@ -449,6 +449,7 @@ static unsigned int ser_access_read(unsigned long addr)
 	return val;
 }
 EXPORT_SYMBOL(ser_access_read);
+
 static int ser_access_write(unsigned long addr, unsigned long data)
 {
 	unsigned long flags;
