@@ -64,8 +64,8 @@
 #define MODULE_NAME "amvideocap"
 #define DEVICE_NAME "amvideocap"
 
-#define CAP_WIDTH_MAX      3840
-#define CAP_HEIGHT_MAX     2160
+#define CAP_WIDTH_MAX      1920
+#define CAP_HEIGHT_MAX     1080
 
 MODULE_DESCRIPTION("Video Frame capture");
 MODULE_AUTHOR("amlogic-bj");
